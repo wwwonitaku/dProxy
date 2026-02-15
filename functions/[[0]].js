@@ -4,98 +4,81 @@ export async function onRequest(context) {
   const { request } = context;
   const url = new URL(request.url);
 
-  /* =========================
-     1. KIỂM TRA CACHE
-     ========================= */
+  // 1. KIỂM TRA CACHE
   const cache = caches.default;
   const cacheKey = new Request(url.toString(), { method: "GET" });
   let cachedResponse = await cache.match(cacheKey);
-  if (cachedResponse) {
-    console.log(`[CACHE HIT] ${url.pathname}`);
-    return cachedResponse;
-  }
+  if (cachedResponse) return cachedResponse;
 
-  /* =========================
-     2. XỬ LÝ PATH
-     ========================= */
+  // 2. XỬ LÝ PATH
   const cleanPath = url.pathname.replace(/^\/+/, "");
-  if (!cleanPath || cleanPath === "favicon.ico") {
-    return new Response("Not Found", { status: 404 });
-  }
+  if (!cleanPath || cleanPath === "favicon.ico") return new Response("Not Found", { status: 404 });
 
-  /* =========================
-     3. TẠO URL NGUỒN (SSPLAY)
-     ========================= */
+  // 3. LẤY LINK DISCORD TỪ SSPLAY
   const lookupUrl = `https://${ALLOWED_ROOT_DOMAIN}/imeCDN/${cleanPath}.html`;
-  console.log(`[1. LOOKUP] Đang kiểm tra link nguồn: ${lookupUrl}`);
-
+  
   try {
-    /* =========================
-       4. FETCH VÀ THEO DÕI REDIRECT
-       ========================= */
-    const originResponse = await fetch(lookupUrl, {
+    // Gọi đến ssplay để lấy link redirect, nhưng KHÔNG tự động follow
+    const lookupRes = await fetch(lookupUrl, {
       method: "GET",
+      redirect: "manual", // QUAN TRỌNG: Không tự động follow để lấy được link Discord
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": `https://${ALLOWED_ROOT_DOMAIN}/`
-      },
-      redirect: "follow" // Cho phép tự động chuyển hướng đến Discord
-    });
-
-    const finalUrl = originResponse.url; // Đây là link cuối cùng (Discord) sau khi redirect
-    const status = originResponse.status;
-
-    console.log(`[2. FINAL URL] Link cuối cùng nhận được: ${finalUrl}`);
-    console.log(`[3. STATUS] Mã trạng thái: ${status}`);
-
-    // TRƯỜNG HỢP LỖI NGUỒN
-    if (!originResponse.ok) {
-      const errorMsg = `
-        LỖI TỪ NGUỒN GỐC (ORIGIN ERROR)
-        -------------------------------
-        - Link truy cập: ${url.href}
-        - Link lookup (SSPLAY): ${lookupUrl}
-        - Link đích cuối cùng (Discord): ${finalUrl}
-        - Trạng thái lỗi: ${status}
-        
-        Giải thích: Server nguồn trả về lỗi. Hãy kiểm tra xem link .html có tồn tại hoặc link Discord có bị hết hạn không.
-      `;
-      console.error(`[ERROR] ${errorMsg}`);
-      return new Response(errorMsg, { status: status });
-    }
-
-    /* =========================
-       5. LƯU CACHE VÀ TRẢ VỀ DỮ LIỆU
-       ========================= */
-    // Đọc dữ liệu (blob) để đảm bảo lấy được nội dung file
-    const data = await originResponse.blob();
-    
-    // Tạo response mới để thêm header cache
-    const response = new Response(data, {
-      status: 200,
-      headers: {
-        "Content-Type": originResponse.headers.get("Content-Type") || "image/jpeg",
-        "Cache-Control": "public, max-age=31536000, immutable",
-        "X-Origin-Final-Url": finalUrl, // Trả về header này để bạn check link discord bằng trình duyệt
-        "Access-Control-Allow-Origin": "*",
-        "X-Content-Type-Options": "nosniff"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
       }
     });
 
-    // Lưu vào Cache
-    context.waitUntil(cache.put(cacheKey, response.clone()));
-    
-    console.log(`[SUCCESS] Đã tải và lưu cache cho: ${cleanPath}`);
-    return response;
+    // Lấy link Discord từ Header "Location" (Nếu ssplay trả về 301/302)
+    let discordUrl = lookupRes.headers.get("Location");
+
+    // Nếu không có Location, có thể server trả về 200 (follow tự động)
+    if (!discordUrl) {
+        if (lookupRes.status === 200) {
+            discordUrl = lookupRes.url; 
+        } else {
+            return new Response(`Error: Không lấy được link Discord từ ssplay (Status: ${lookupRes.status})`, { status: 500 });
+        }
+    }
+
+    // 4. GỌI ĐẾN DISCORD VỚI HEADER "SẠCH"
+    // Đây là bước quan trọng nhất để lách 403
+    const discordResponse = await fetch(discordUrl, {
+      method: "GET",
+      headers: {
+        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Sec-Fetch-Dest": "image",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "cross-site",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        // TUYỆT ĐỐI KHÔNG gửi Referer từ ssplay qua đây, Discord sẽ chặn
+      }
+    });
+
+    if (!discordResponse.ok) {
+      const errorText = await discordResponse.text();
+      return new Response(`Discord Refused (403): Link của bạn có thể đã hết hạn hoặc Discord chặn IP Cloudflare.\nLink check: ${discordUrl}`, { 
+        status: discordResponse.status 
+      });
+    }
+
+    // 5. LƯU VÀO CACHE VÀ TRẢ VỀ
+    const finalResponse = new Response(discordResponse.body, {
+      status: 200,
+      headers: {
+        "Content-Type": discordResponse.headers.get("Content-Type") || "image/jpeg",
+        "Cache-Control": "public, max-age=31536000, immutable", // Cache 1 năm
+        "Access-Control-Allow-Origin": "*",
+        "X-Proxy-Origin": "Discord-Lach-Luat"
+      }
+    });
+
+    context.waitUntil(cache.put(cacheKey, finalResponse.clone()));
+    return finalResponse;
 
   } catch (err) {
-    const internalError = `
-      LỖI HỆ THỐNG (WORKER ERROR)
-      ---------------------------
-      - Message: ${err.message}
-      - Lookup URL: ${lookupUrl}
-    `;
-    console.error(`[CRITICAL] ${internalError}`);
-    return new Response(internalError, { status: 500 });
+    return new Response("Worker Error: " + err.message, { status: 500 });
   }
 }
